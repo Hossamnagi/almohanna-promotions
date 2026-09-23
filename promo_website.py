@@ -25,12 +25,15 @@ The page supports both light and dark mode: it follows the visitor's
 OS/browser preference by default, and a toggle button in the toolbar
 lets them override it (remembered per-browser via localStorage).
 
-Includes a camera barcode scanner (via the ZXing JS library, loaded
-from jsDelivr) -- works in any modern mobile browser, including iOS
-Safari, once this page is served over HTTPS (e.g. GitHub Pages). It
-will NOT get camera access inside a sandboxed preview iframe (such as
-a Claude.ai artifact preview) -- that's expected there, and normal on
-a real hosted URL.
+Includes a camera barcode scanner. It prefers the browser's native
+BarcodeDetector API (Chrome/Edge/Android) since it decodes off the JS
+thread and is noticeably faster; browsers without it (notably iOS
+Safari) fall back to the ZXing JS library, lazy-loaded from jsDelivr
+only when actually needed. Works in any modern mobile browser once
+this page is served over HTTPS (e.g. GitHub Pages). It will NOT get
+camera access inside a sandboxed preview iframe (such as a Claude.ai
+artifact preview) -- that's expected there, and normal on a real
+hosted URL.
 """
 
 import sys
@@ -847,6 +850,8 @@ const scanStatus = document.getElementById('scanStatus');
 let zxingLoadPromise = null;
 let codeReader = null;
 let scanControls = null;
+let nativeStream = null;
+let nativeLoopActive = false;
 
 function ensureZXingLoaded(){
   if(window.ZXing) return Promise.resolve();
@@ -861,6 +866,93 @@ function ensureZXingLoaded(){
   return zxingLoadPromise;
 }
 
+// Chrome/Edge/Android expose a native, hardware-accelerated barcode
+// reader (Shape Detection API) that decodes off the main JS thread --
+// much faster than the pure-JS ZXing fallback below. Safari/iOS and
+// older browsers don't implement it, so ZXing stays as the fallback.
+async function nativeDetectorSupported(){
+  if(!('BarcodeDetector' in window)) return false;
+  try{
+    const formats = await BarcodeDetector.getSupportedFormats();
+    return Array.isArray(formats) && formats.length > 0;
+  }catch(e){
+    return false;
+  }
+}
+
+function cameraErrorMessage(e){
+  return (e && e.name === 'NotAllowedError')
+    ? 'Camera permission was denied.'
+    : (e && e.message) ? e.message : 'Camera unavailable in this view.';
+}
+
+async function startNativeScanner(){
+  const wanted = ['ean_13','ean_8','upc_a','upc_e','code_128','code_39','itf','codabar','qr_code'];
+  let formats = wanted;
+  try{
+    const available = await BarcodeDetector.getSupportedFormats();
+    const overlap = wanted.filter(f => available.includes(f));
+    formats = overlap.length ? overlap : available;
+  }catch(e){ /* keep the default wish list */ }
+
+  const detector = new BarcodeDetector({ formats });
+
+  nativeStream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: { ideal: 'environment' } }
+  });
+  scanVideo.srcObject = nativeStream;
+  await scanVideo.play();
+  scanStatus.textContent = 'Point the camera at a barcode';
+
+  nativeLoopActive = true;
+  let detecting = false;
+
+  const scheduleNext = (fn) => {
+    if(scanVideo.requestVideoFrameCallback) scanVideo.requestVideoFrameCallback(fn);
+    else setTimeout(fn, 120);
+  };
+
+  const tick = async () => {
+    if(!nativeLoopActive) return;
+    if(!detecting){
+      detecting = true;
+      try{
+        const codes = await detector.detect(scanVideo);
+        if(codes && codes.length){
+          nativeLoopActive = false;
+          searchInput.value = codes[0].rawValue;
+          applyFilters();
+          closeScanner();
+          return;
+        }
+      }catch(e){
+        // a blurry/empty frame is normal mid-scan -- keep trying
+      }
+      detecting = false;
+    }
+    if(nativeLoopActive) scheduleNext(tick);
+  };
+
+  scheduleNext(tick);
+}
+
+async function startZXingScanner(){
+  await ensureZXingLoaded();
+  codeReader = new ZXing.BrowserMultiFormatReader();
+  scanControls = await codeReader.decodeFromConstraints(
+    { video: { facingMode: { ideal: 'environment' } } },
+    scanVideo,
+    (result, err, controls) => {
+      if(result){
+        searchInput.value = result.getText();
+        applyFilters();
+        closeScanner();
+      }
+    }
+  );
+  scanStatus.textContent = 'Point the camera at a barcode';
+}
+
 async function openScanner(){
   scanOverlay.classList.add('open');
   scanStatus.textContent = 'Starting camera…';
@@ -868,31 +960,23 @@ async function openScanner(){
     scanStatus.textContent = 'Camera access is not available in this browser.';
     return;
   }
+  const useNative = await nativeDetectorSupported();
   try{
-    await ensureZXingLoaded();
-    codeReader = new ZXing.BrowserMultiFormatReader();
-    scanControls = await codeReader.decodeFromConstraints(
-      { video: { facingMode: { ideal: 'environment' } } },
-      scanVideo,
-      (result, err, controls) => {
-        if(result){
-          searchInput.value = result.getText();
-          applyFilters();
-          closeScanner();
-        }
-      }
-    );
-    scanStatus.textContent = 'Point the camera at a barcode';
+    if(useNative) await startNativeScanner();
+    else await startZXingScanner();
   } catch(e){
-    const msg = (e && e.name === 'NotAllowedError')
-      ? 'Camera permission was denied.'
-      : (e && e.message) ? e.message : 'Camera unavailable in this view.';
-    scanStatus.textContent = msg;
+    scanStatus.textContent = cameraErrorMessage(e);
   }
 }
 
 function closeScanner(){
   scanOverlay.classList.remove('open');
+  nativeLoopActive = false;
+  if(nativeStream){
+    nativeStream.getTracks().forEach(t => t.stop());
+    nativeStream = null;
+  }
+  scanVideo.srcObject = null;
   if(scanControls){
     try{ scanControls.stop(); } catch(e){}
     scanControls = null;
