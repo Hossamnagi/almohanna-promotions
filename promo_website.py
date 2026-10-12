@@ -429,6 +429,20 @@ input[type="date"]:focus{outline:none;border-color:var(--violet);}
   border-bottom:1px solid var(--border-strong);
 }
 .group-header:first-child{margin-top:0;}
+.group-header{cursor:pointer;user-select:none;}
+.group-header:hover h2{color:var(--violet);}
+.group-header:focus-visible{outline:2px solid var(--violet);outline-offset:4px;border-radius:var(--radius-s);}
+.group-chevron{
+  width:16px;height:16px;
+  flex-shrink:0;
+  align-self:center;
+  color:var(--muted);
+  transition:transform .15s;
+}
+.group-header.collapsed .group-chevron{transform:rotate(-90deg);}
+.card.group-hidden{display:none;}
+.toggle-all-btn{color:var(--violet);}
+.toggle-all-btn:hover{background:rgba(139,107,255,0.1);}
 .group-header h2{
   font-family:var(--font-display);
   font-size:17px;
@@ -673,6 +687,7 @@ TEMPLATE_BODY = """<header class="masthead">
         <option value="ending">Sort: Ending soonest</option>
         <option value="brand">Sort: Brand</option>
       </select>
+      <button class="clear-btn toggle-all-btn" id="toggleAllBtn" type="button" hidden>Collapse all</button>
       <button class="clear-btn" id="clearBtn">Clear filters</button>
     </div>
   </div>
@@ -719,6 +734,7 @@ const resultCount = document.getElementById('resultCount');
 const loadMoreWrap = document.getElementById('loadMoreWrap');
 const loadMoreBtn = document.getElementById('loadMoreBtn');
 const clearBtn = document.getElementById('clearBtn');
+const toggleAllBtn = document.getElementById('toggleAllBtn');
 
 function uniqueSorted(key){
   const s = new Set();
@@ -763,13 +779,13 @@ function computeDiscountPct(r){
 
 let MAX_ACT_DATE = null;
 
-function cardHtml(r){
+function cardHtml(r, hidden, gi){
   const finalPrice = r.priceAfterDisc || r.priceTax;
   const showWas = r.priceAfterDisc && r.priceTax && r.priceAfterDisc < r.priceTax;
   const days = daysLeft(r.endDate);
   const endingSoon = days !== null && days <= 7 && days >= 0;
   const isNew = r.actDate && MAX_ACT_DATE && (MAX_ACT_DATE - new Date(r.actDate+'T00:00:00')) <= 3*86400000;
-  return `<div class="card">
+  return `<div class="card${hidden ? ' group-hidden' : ''}"${gi != null ? ` data-gi="${gi}"` : ''}>
     <div class="card-top">
       <span class="brand-tag">${escapeHtml(r.brand||'')}</span>
       ${r.subGroup ? `<span class="subgroup-tag">${escapeHtml(r.subGroup)}</span>` : ''}
@@ -807,8 +823,16 @@ function sortCompare(a, b, sort){
 // Items are sorted by group first (brand A-Z / soonest end date), then by
 // the chosen sort inside each group; a header is drawn whenever the group
 // key changes, so "Show more" keeps appending into the right group.
+// Clicking a header collapses/expands that group. Cards of collapsed groups
+// are still rendered (hidden) but don't count toward PAGE_SIZE, so
+// "Collapse all" shows every group header at once as a compact index.
 let groupCounts = new Map();
+let groupKeys = [];               // group index (data-gi) -> group key
+let groupIndex = new Map();       // group key -> group index
+let collapsedGroups = new Set();  // keys of collapsed groups
+let collapsedMode = '';           // grouping the collapsed set belongs to
 let lastGroupKey = null;
+const CHEVRON = '<svg class="group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M6 9l6 6 6-6"/></svg>';
 
 function groupKey(r){
   const g = groupSelect.value;
@@ -830,13 +854,40 @@ function groupCompare(a, b){
 function groupHeaderHtml(key){
   const n = groupCounts.get(key) || 0;
   const count = `<span class="group-count">${n} item${n===1?'':'s'}</span>`;
+  const collapsed = collapsedGroups.has(key);
+  const open = `<div class="group-header${collapsed ? ' collapsed' : ''}" data-gi="${groupIndex.get(key)}" role="button" tabindex="0" aria-expanded="${!collapsed}">${CHEVRON}`;
   if(groupSelect.value === 'brand'){
-    return `<div class="group-header"><h2>${escapeHtml(key || 'No brand')}</h2>${count}</div>`;
+    return `${open}<h2>${escapeHtml(key || 'No brand')}</h2>${count}</div>`;
   }
-  if(!key) return `<div class="group-header"><h2>No end date</h2>${count}</div>`;
+  if(!key) return `${open}<h2>No end date</h2>${count}</div>`;
   const d = daysLeft(key);
   const note = d < 0 ? 'Ended' : d === 0 ? 'Ends today' : `${d} day${d===1?'':'s'} left`;
-  return `<div class="group-header"><h2>Ends ${fmtDate(key)}</h2>${count}<span class="group-note">${note}</span></div>`;
+  return `${open}<h2>Ends ${fmtDate(key)}</h2>${count}<span class="group-note">${note}</span></div>`;
+}
+
+function updateToggleAllBtn(){
+  toggleAllBtn.hidden = !groupSelect.value || groupKeys.length === 0;
+  const allCollapsed = groupKeys.length > 0 && groupKeys.every(k => collapsedGroups.has(k));
+  toggleAllBtn.textContent = allCollapsed ? 'Expand all' : 'Collapse all';
+}
+
+function toggleGroup(header){
+  const gi = header.dataset.gi;
+  const key = groupKeys[gi];
+  const collapse = !collapsedGroups.has(key);
+  if(collapse) collapsedGroups.add(key); else collapsedGroups.delete(key);
+  header.classList.toggle('collapsed', collapse);
+  header.setAttribute('aria-expanded', String(!collapse));
+  grid.querySelectorAll(`.card[data-gi="${gi}"]`).forEach(c => c.classList.toggle('group-hidden', collapse));
+  updateToggleAllBtn();
+}
+
+function toggleAllGroups(){
+  const allCollapsed = groupKeys.every(k => collapsedGroups.has(k));
+  collapsedGroups = allCollapsed ? new Set() : new Set(groupKeys);
+  shown = 0;
+  renderPage(true);
+  updateToggleAllBtn();
 }
 
 function applyFilters(){
@@ -871,29 +922,41 @@ function applyFilters(){
   if(groupSelect.value){
     filtered.forEach(r=>{ const k = groupKey(r); groupCounts.set(k, (groupCounts.get(k)||0) + 1); });
   }
+  groupKeys = Array.from(groupCounts.keys());
+  groupIndex = new Map(groupKeys.map((k, i) => [k, i]));
+  if(collapsedMode !== groupSelect.value){   // switching Brand <-> End date starts fully expanded
+    collapsedGroups = new Set();
+    collapsedMode = groupSelect.value;
+  }
 
   shown = 0;
   renderPage(true);
+  updateToggleAllBtn();
 }
 
 function renderPage(reset){
   if(reset){ grid.innerHTML = ''; lastGroupKey = null; }
-  const next = filtered.slice(shown, shown + PAGE_SIZE);
   if(filtered.length === 0){
     grid.innerHTML = `<div class="empty-state"><span class="glyph">∅</span>No items match these filters.<br><button id="resetFromEmpty">Clear filters</button></div>`;
     document.getElementById('resetFromEmpty').onclick = clearFilters;
     loadMoreWrap.style.display = 'none';
   } else {
     const grouped = !!groupSelect.value;
-    grid.insertAdjacentHTML('beforeend', next.map(r=>{
-      let head = '';
+    let html = '';
+    let visible = 0;
+    while(shown < filtered.length && visible < PAGE_SIZE){
+      const r = filtered[shown++];
+      let gi = null, hidden = false;
       if(grouped){
         const k = groupKey(r);
-        if(k !== lastGroupKey){ lastGroupKey = k; head = groupHeaderHtml(k); }
+        gi = groupIndex.get(k);
+        hidden = collapsedGroups.has(k);
+        if(k !== lastGroupKey){ lastGroupKey = k; html += groupHeaderHtml(k); }
       }
-      return head + cardHtml(r);
-    }).join(''));
-    shown += next.length;
+      if(!hidden) visible++;
+      html += cardHtml(r, hidden, gi);
+    }
+    grid.insertAdjacentHTML('beforeend', html);
     loadMoreWrap.style.display = shown < filtered.length ? 'flex' : 'none';
   }
   resultCount.textContent = `${filtered.length} item${filtered.length===1?'':'s'}`;
@@ -917,6 +980,16 @@ loadMoreBtn.addEventListener('click', ()=>renderPage(false));
 [categoryFilter, brandFilter, typeFilter, offerFilter, startFromInput, endByInput, groupSelect, sortSelect]
   .forEach(el=>el.addEventListener('change', applyFilters));
 clearBtn.addEventListener('click', clearFilters);
+toggleAllBtn.addEventListener('click', toggleAllGroups);
+grid.addEventListener('click', e=>{
+  const h = e.target.closest('.group-header');
+  if(h) toggleGroup(h);
+});
+grid.addEventListener('keydown', e=>{
+  if(e.key !== 'Enter' && e.key !== ' ') return;
+  const h = e.target.closest('.group-header');
+  if(h){ e.preventDefault(); toggleGroup(h); }
+});
 
 // init
 populateSelect(categoryFilter, uniqueSorted('subGroup'));
