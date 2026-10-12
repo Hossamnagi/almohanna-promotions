@@ -402,6 +402,50 @@ select:focus{outline:none;border-color:var(--violet);}
   font-weight:600;
 }
 .clear-btn:hover{background:rgba(255,95,168,0.1);}
+.date-field{
+  display:flex;align-items:center;gap:6px;
+  font-size:12px;
+  color:var(--muted);
+  white-space:nowrap;
+}
+input[type="date"]{
+  font-family:var(--font-sans);
+  font-size:13.5px;
+  padding:7px 10px;
+  border:1.5px solid var(--border);
+  border-radius:var(--radius-m);
+  background:var(--card);
+  color:var(--ink);
+  cursor:pointer;
+}
+input[type="date"]:focus{outline:none;border-color:var(--violet);}
+
+/* ---------- Group headers ---------- */
+.group-header{
+  grid-column:1/-1;
+  display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;
+  margin-top:16px;
+  padding-bottom:6px;
+  border-bottom:1px solid var(--border-strong);
+}
+.group-header:first-child{margin-top:0;}
+.group-header h2{
+  font-family:var(--font-display);
+  font-size:17px;
+  font-weight:600;
+  margin:0;
+  color:var(--ink);
+}
+.group-count{
+  font-family:var(--font-mono);
+  font-size:12px;
+  color:var(--blue);
+}
+.group-note{
+  font-size:12px;
+  font-weight:600;
+  color:var(--pink);
+}
 
 /* ---------- Grid ---------- */
 main{max-width:1320px;margin:0 auto;padding:26px 28px 60px;}
@@ -573,7 +617,10 @@ main{max-width:1320px;margin:0 auto;padding:26px 28px 60px;}
   .masthead{padding:28px 16px 20px;}
   .toolbar{padding:12px 16px;}
   main{padding:18px 16px 50px;}
-  select{max-width:none;flex:1;}
+  .filters-row{display:grid;grid-template-columns:1fr 1fr;}
+  select{max-width:none;width:100%;min-width:0;}
+  .date-field{flex-direction:column;align-items:stretch;gap:3px;min-width:0;}
+  .date-field input{width:100%;min-width:0;}
 }
 </style>
 </head>
@@ -610,6 +657,13 @@ TEMPLATE_BODY = """<header class="masthead">
       <select id="brandFilter"><option value="">All brands</option></select>
       <select id="typeFilter"><option value="">All promotion types</option></select>
       <select id="offerFilter"><option value="">All offers</option></select>
+      <label class="date-field">Starts from <input type="date" id="startFrom"></label>
+      <label class="date-field">Ends by <input type="date" id="endBy"></label>
+      <select id="groupSelect">
+        <option value="">Group: None</option>
+        <option value="brand">Group: Brand</option>
+        <option value="endDate">Group: End date</option>
+      </select>
       <select id="sortSelect">
         <option value="recent">Sort: Recently added</option>
         <option value="name">Sort: Name (A–Z)</option>
@@ -657,6 +711,9 @@ const categoryFilter = document.getElementById('categoryFilter');
 const brandFilter = document.getElementById('brandFilter');
 const typeFilter = document.getElementById('typeFilter');
 const offerFilter = document.getElementById('offerFilter');
+const startFromInput = document.getElementById('startFrom');
+const endByInput = document.getElementById('endBy');
+const groupSelect = document.getElementById('groupSelect');
 const sortSelect = document.getElementById('sortSelect');
 const resultCount = document.getElementById('resultCount');
 const loadMoreWrap = document.getElementById('loadMoreWrap');
@@ -735,18 +792,71 @@ function cardHtml(r){
   </div>`;
 }
 
+function sortCompare(a, b, sort){
+  if(sort === 'name') return (a.nameEn||'').localeCompare(b.nameEn||'');
+  if(sort === 'brand') return (a.brand||'').localeCompare(b.brand||'');
+  if(sort === 'priceAsc') return (a.priceAfterDisc||a.priceTax||0) - (b.priceAfterDisc||b.priceTax||0);
+  if(sort === 'priceDesc') return (b.priceAfterDisc||b.priceTax||0) - (a.priceAfterDisc||a.priceTax||0);
+  if(sort === 'discount') return computeDiscountPct(b) - computeDiscountPct(a);
+  if(sort === 'ending') return new Date(a.endDate) - new Date(b.endDate);
+  if(sort === 'recent') return new Date(b.actDate) - new Date(a.actDate);
+  return 0;
+}
+
+// ---------- Grouping ----------
+// Items are sorted by group first (brand A-Z / soonest end date), then by
+// the chosen sort inside each group; a header is drawn whenever the group
+// key changes, so "Show more" keeps appending into the right group.
+let groupCounts = new Map();
+let lastGroupKey = null;
+
+function groupKey(r){
+  const g = groupSelect.value;
+  if(g === 'brand') return r.brand || '';
+  if(g === 'endDate') return r.endDate || '';
+  return null;
+}
+
+function groupCompare(a, b){
+  const g = groupSelect.value;
+  if(!g) return 0;
+  const ka = groupKey(a), kb = groupKey(b);
+  if(ka === kb) return 0;
+  if(!ka) return 1;           // items without a brand / end date go last
+  if(!kb) return -1;
+  return g === 'brand' ? ka.localeCompare(kb) : (ka < kb ? -1 : 1);
+}
+
+function groupHeaderHtml(key){
+  const n = groupCounts.get(key) || 0;
+  const count = `<span class="group-count">${n} item${n===1?'':'s'}</span>`;
+  if(groupSelect.value === 'brand'){
+    return `<div class="group-header"><h2>${escapeHtml(key || 'No brand')}</h2>${count}</div>`;
+  }
+  if(!key) return `<div class="group-header"><h2>No end date</h2>${count}</div>`;
+  const d = daysLeft(key);
+  const note = d < 0 ? 'Ended' : d === 0 ? 'Ends today' : `${d} day${d===1?'':'s'} left`;
+  return `<div class="group-header"><h2>Ends ${fmtDate(key)}</h2>${count}<span class="group-note">${note}</span></div>`;
+}
+
 function applyFilters(){
   const q = searchInput.value.trim().toLowerCase();
   const cat = categoryFilter.value;
   const brand = brandFilter.value;
   const type = typeFilter.value;
   const offer = offerFilter.value;
+  // date inputs give 'YYYY-MM-DD', the same format as actDate/endDate,
+  // so plain string comparison orders them correctly
+  const startFrom = startFromInput.value;
+  const endBy = endByInput.value;
 
   filtered = DATA.filter(r=>{
     if(cat && r.subGroup !== cat) return false;
     if(brand && r.brand !== brand) return false;
     if(type && r.type !== type) return false;
     if(offer && r.offer !== offer) return false;
+    if(startFrom && (!r.actDate || r.actDate < startFrom)) return false;
+    if(endBy && (!r.endDate || r.endDate > endBy)) return false;
     if(q){
       const hay = (r.nameEn+' '+r.nameAr+' '+r.brand+' '+r.code+' '+r.barcode).toLowerCase();
       if(!hay.includes(q)) return false;
@@ -755,30 +865,34 @@ function applyFilters(){
   });
 
   const sort = sortSelect.value;
-  filtered.sort((a,b)=>{
-    if(sort === 'name') return (a.nameEn||'').localeCompare(b.nameEn||'');
-    if(sort === 'brand') return (a.brand||'').localeCompare(b.brand||'');
-    if(sort === 'priceAsc') return (a.priceAfterDisc||a.priceTax||0) - (b.priceAfterDisc||b.priceTax||0);
-    if(sort === 'priceDesc') return (b.priceAfterDisc||b.priceTax||0) - (a.priceAfterDisc||a.priceTax||0);
-    if(sort === 'discount') return computeDiscountPct(b) - computeDiscountPct(a);
-    if(sort === 'ending') return new Date(a.endDate) - new Date(b.endDate);
-    if(sort === 'recent') return new Date(b.actDate) - new Date(a.actDate);
-    return 0;
-  });
+  filtered.sort((a,b)=> groupCompare(a,b) || sortCompare(a,b,sort));
+
+  groupCounts = new Map();
+  if(groupSelect.value){
+    filtered.forEach(r=>{ const k = groupKey(r); groupCounts.set(k, (groupCounts.get(k)||0) + 1); });
+  }
 
   shown = 0;
   renderPage(true);
 }
 
 function renderPage(reset){
-  if(reset) grid.innerHTML = '';
+  if(reset){ grid.innerHTML = ''; lastGroupKey = null; }
   const next = filtered.slice(shown, shown + PAGE_SIZE);
   if(filtered.length === 0){
     grid.innerHTML = `<div class="empty-state"><span class="glyph">∅</span>No items match these filters.<br><button id="resetFromEmpty">Clear filters</button></div>`;
     document.getElementById('resetFromEmpty').onclick = clearFilters;
     loadMoreWrap.style.display = 'none';
   } else {
-    grid.insertAdjacentHTML('beforeend', next.map(cardHtml).join(''));
+    const grouped = !!groupSelect.value;
+    grid.insertAdjacentHTML('beforeend', next.map(r=>{
+      let head = '';
+      if(grouped){
+        const k = groupKey(r);
+        if(k !== lastGroupKey){ lastGroupKey = k; head = groupHeaderHtml(k); }
+      }
+      return head + cardHtml(r);
+    }).join(''));
     shown += next.length;
     loadMoreWrap.style.display = shown < filtered.length ? 'flex' : 'none';
   }
@@ -791,13 +905,17 @@ function clearFilters(){
   brandFilter.value = '';
   typeFilter.value = '';
   offerFilter.value = '';
+  startFromInput.value = '';
+  endByInput.value = '';
+  groupSelect.value = '';
   sortSelect.value = 'recent';
   applyFilters();
 }
 
 loadMoreBtn.addEventListener('click', ()=>renderPage(false));
 [searchInput].forEach(el=>el.addEventListener('input', applyFilters));
-[categoryFilter, brandFilter, typeFilter, offerFilter, sortSelect].forEach(el=>el.addEventListener('change', applyFilters));
+[categoryFilter, brandFilter, typeFilter, offerFilter, startFromInput, endByInput, groupSelect, sortSelect]
+  .forEach(el=>el.addEventListener('change', applyFilters));
 clearBtn.addEventListener('click', clearFilters);
 
 // init
@@ -811,6 +929,15 @@ document.getElementById('brandCount').textContent = new Set(DATA.map(r=>r.brand)
 
 const actDates = DATA.map(r=>r.actDate).filter(Boolean).map(d=>new Date(d+'T00:00:00'));
 MAX_ACT_DATE = actDates.length ? new Date(Math.max(...actDates)) : null;
+
+// limit both calendars to the date range that actually exists in the data
+const allDates = DATA.flatMap(r=>[r.actDate, r.endDate]).filter(Boolean).sort();
+if(allDates.length){
+  [startFromInput, endByInput].forEach(el=>{
+    el.min = allDates[0];
+    el.max = allDates[allDates.length - 1];
+  });
+}
 
 applyFilters();
 
