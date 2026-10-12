@@ -446,9 +446,22 @@ input[type="date"]:focus{outline:none;border-color:var(--violet);}
   transition:transform .15s;
 }
 .group-header.collapsed .group-chevron{transform:rotate(-90deg);}
-.card.group-hidden{display:none;}
 .toggle-all-btn{color:var(--violet);}
 .toggle-all-btn:hover{background:rgba(139,107,255,0.1);}
+.group-header.sub{
+  margin:6px 0 0 24px;
+  padding-bottom:4px;
+  border-bottom:1px dashed var(--border);
+}
+.group-header h3{
+  font-family:var(--font-display);
+  font-size:14.5px;
+  font-weight:600;
+  margin:0;
+  color:var(--ink);
+}
+.group-header:hover h3{color:var(--violet);}
+select[hidden]{display:none;}
 .group-header h2{
   font-family:var(--font-display);
   font-size:17px;
@@ -691,6 +704,11 @@ TEMPLATE_BODY = """<header class="masthead">
         <option value="brand">Group: Brand</option>
         <option value="endDate">Group: End date</option>
       </select>
+      <select id="thenSelect" hidden>
+        <option value="">Then by: None</option>
+        <option value="brand">Then by: Brand</option>
+        <option value="endDate">Then by: End date</option>
+      </select>
       <select id="sortSelect">
         <option value="recent">Sort: Recently added</option>
         <option value="name">Sort: Name (A–Z)</option>
@@ -743,6 +761,7 @@ const dateField = document.getElementById('dateField');
 const dateFromInput = document.getElementById('dateFrom');
 const dateToInput = document.getElementById('dateTo');
 const groupSelect = document.getElementById('groupSelect');
+const thenSelect = document.getElementById('thenSelect');
 const sortSelect = document.getElementById('sortSelect');
 const resultCount = document.getElementById('resultCount');
 const loadMoreWrap = document.getElementById('loadMoreWrap');
@@ -793,13 +812,13 @@ function computeDiscountPct(r){
 
 let MAX_ACT_DATE = null;
 
-function cardHtml(r, hidden, gi){
+function cardHtml(r){
   const finalPrice = r.priceAfterDisc || r.priceTax;
   const showWas = r.priceAfterDisc && r.priceTax && r.priceAfterDisc < r.priceTax;
   const days = daysLeft(r.endDate);
   const endingSoon = days !== null && days <= 7 && days >= 0;
   const isNew = r.actDate && MAX_ACT_DATE && (MAX_ACT_DATE - new Date(r.actDate+'T00:00:00')) <= 3*86400000;
-  return `<div class="card${hidden ? ' group-hidden' : ''}"${gi != null ? ` data-gi="${gi}"` : ''}>
+  return `<div class="card">
     <div class="card-top">
       <span class="brand-tag">${escapeHtml(r.brand||'')}</span>
       ${r.subGroup ? `<span class="subgroup-tag">${escapeHtml(r.subGroup)}</span>` : ''}
@@ -834,76 +853,102 @@ function sortCompare(a, b, sort){
 }
 
 // ---------- Grouping ----------
-// Items are sorted by group first (brand A-Z / soonest end date), then by
-// the chosen sort inside each group; a header is drawn whenever the group
-// key changes, so "Show more" keeps appending into the right group.
-// Clicking a header collapses/expands that group. Cards of collapsed groups
-// are still rendered (hidden) but don't count toward PAGE_SIZE, so
-// "Collapse all" shows every group header at once as a compact index.
-let groupCounts = new Map();
-let groupKeys = [];               // group index (data-gi) -> group key
-let groupIndex = new Map();       // group key -> group index
-let collapsedGroups = new Set();  // keys of collapsed groups
+// Up to two levels (Group, then "Then by"), e.g. End date > Brand. Items are
+// sorted by level 1, then level 2, then the chosen sort; a header is drawn
+// whenever a level's key changes, so "Show more" keeps appending into the
+// right group. A group's id is its level plus the full key path, so a brand
+// under two different end dates is two separate groups.
+// Collapsed groups are skipped while rendering and don't count toward
+// PAGE_SIZE, so "Collapse all" shows every top-level header at once as a
+// compact index. Toggling a header re-renders (keeping as many cards as were
+// on screen) so paging stays consistent.
+const SEP = '␟';
+let groupLevels = [];             // e.g. ['endDate', 'brand']
+let groupCounts = new Map();      // group id -> item count
+let topGroupIds = [];             // level-1 ids in display order
+let collapsedGroups = new Set();  // ids of collapsed groups
 let collapsedMode = '';           // grouping the collapsed set belongs to
-let lastGroupKey = null;
+let lastGroupIds = [];
 const CHEVRON = '<svg class="group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M6 9l6 6 6-6"/></svg>';
 
-function groupKey(r){
-  const g = groupSelect.value;
-  if(g === 'brand') return r.brand || '';
-  if(g === 'endDate') return r.endDate || '';
-  return null;
+function keyFor(level, r){
+  return level === 'brand' ? (r.brand || '') : (r.endDate || '');
 }
 
-function groupCompare(a, b){
-  const g = groupSelect.value;
-  if(!g) return 0;
-  const ka = groupKey(a), kb = groupKey(b);
+function groupIdsFor(r){
+  let path = '';
+  return groupLevels.map((lvl, i) => { path += SEP + keyFor(lvl, r); return (i + 1) + path; });
+}
+
+function compareLevel(level, a, b){
+  const ka = keyFor(level, a), kb = keyFor(level, b);
   if(ka === kb) return 0;
   if(!ka) return 1;           // items without a brand / end date go last
   if(!kb) return -1;
-  return g === 'brand' ? ka.localeCompare(kb) : (ka < kb ? -1 : 1);
+  return level === 'brand' ? ka.localeCompare(kb) : (ka < kb ? -1 : 1);
 }
 
-function groupHeaderHtml(key){
-  const n = groupCounts.get(key) || 0;
-  const count = `<span class="group-count">${n} item${n===1?'':'s'}</span>`;
-  const collapsed = collapsedGroups.has(key);
-  const open = `<div class="group-header${collapsed ? ' collapsed' : ''}" data-gi="${groupIndex.get(key)}" role="button" tabindex="0" aria-expanded="${!collapsed}">${CHEVRON}`;
-  if(groupSelect.value === 'brand'){
-    return `${open}<h2>${escapeHtml(key || 'No brand')}</h2>${count}</div>`;
+function groupCompare(a, b){
+  for(const lvl of groupLevels){
+    const c = compareLevel(lvl, a, b);
+    if(c) return c;
   }
-  if(!key) return `${open}<h2>No end date</h2>${count}</div>`;
+  return 0;
+}
+
+// "Then by" offers only the field not already used by "Group", and is hidden
+// until a first level is chosen.
+function syncThenSelect(){
+  const first = groupSelect.value;
+  thenSelect.hidden = !first;
+  [...thenSelect.options].forEach(o => { o.disabled = !!o.value && o.value === first; });
+  if(!first || thenSelect.value === first) thenSelect.value = '';
+  groupLevels = [first, thenSelect.value].filter(Boolean);
+}
+
+function groupHeaderHtml(level, depth, key, id){
+  const n = groupCounts.get(id) || 0;
+  const count = `<span class="group-count">${n} item${n===1?'':'s'}</span>`;
+  const collapsed = collapsedGroups.has(id);
+  const tag = depth === 1 ? 'h2' : 'h3';
+  const open = `<div class="group-header${depth > 1 ? ' sub' : ''}${collapsed ? ' collapsed' : ''}" data-gid="${escapeHtml(id)}" role="button" tabindex="0" aria-expanded="${!collapsed}">${CHEVRON}`;
+  if(level === 'brand'){
+    return `${open}<${tag}>${escapeHtml(key || 'No brand')}</${tag}>${count}</div>`;
+  }
+  if(!key) return `${open}<${tag}>No end date</${tag}>${count}</div>`;
   const d = daysLeft(key);
   const note = d < 0 ? 'Ended' : d === 0 ? 'Ends today' : `${d} day${d===1?'':'s'} left`;
-  return `${open}<h2>Ends ${fmtDate(key)}</h2>${count}<span class="group-note">${note}</span></div>`;
+  return `${open}<${tag}>Ends ${fmtDate(key)}</${tag}>${count}<span class="group-note">${note}</span></div>`;
 }
 
 function updateToggleAllBtn(){
-  toggleAllBtn.hidden = !groupSelect.value || groupKeys.length === 0;
-  const allCollapsed = groupKeys.length > 0 && groupKeys.every(k => collapsedGroups.has(k));
+  toggleAllBtn.hidden = groupLevels.length === 0 || topGroupIds.length === 0;
+  const allCollapsed = topGroupIds.length > 0 && topGroupIds.every(id => collapsedGroups.has(id));
   toggleAllBtn.textContent = allCollapsed ? 'Expand all' : 'Collapse all';
 }
 
-function toggleGroup(header){
-  const gi = header.dataset.gi;
-  const key = groupKeys[gi];
-  const collapse = !collapsedGroups.has(key);
-  if(collapse) collapsedGroups.add(key); else collapsedGroups.delete(key);
-  header.classList.toggle('collapsed', collapse);
-  header.setAttribute('aria-expanded', String(!collapse));
-  grid.querySelectorAll(`.card[data-gi="${gi}"]`).forEach(c => c.classList.toggle('group-hidden', collapse));
-  // collapsing hides cards, so pull in the next groups to keep a full page
-  if(collapse){
-    const visibleNow = grid.querySelectorAll('.card:not(.group-hidden)').length;
-    if(visibleNow < PAGE_SIZE) renderPage(false, PAGE_SIZE - visibleNow);
-  }
+function rerender(focusId){
+  const target = Math.max(PAGE_SIZE, grid.querySelectorAll('.card').length);
+  shown = 0;
+  renderPage(true, target);
   updateToggleAllBtn();
+  if(focusId){
+    const h = [...grid.querySelectorAll('.group-header')].find(x => x.dataset.gid === focusId);
+    if(h) h.focus({preventScroll:true});
+  }
 }
 
+function toggleGroup(header){
+  const id = header.dataset.gid;
+  if(collapsedGroups.has(id)) collapsedGroups.delete(id); else collapsedGroups.add(id);
+  rerender(document.activeElement === header ? id : null);
+}
+
+// Collapse all folds every level, so opening an end date shows its brands
+// folded too (a list of brands with counts).
 function toggleAllGroups(){
-  const allCollapsed = groupKeys.every(k => collapsedGroups.has(k));
-  collapsedGroups = allCollapsed ? new Set() : new Set(groupKeys);
+  const allCollapsed = topGroupIds.every(id => collapsedGroups.has(id));
+  collapsedGroups = allCollapsed ? new Set() : new Set(groupCounts.keys());
   shown = 0;
   renderPage(true);
   updateToggleAllBtn();
@@ -946,18 +991,24 @@ function applyFilters(){
     return true;
   });
 
+  syncThenSelect();
   const sort = sortSelect.value;
   filtered.sort((a,b)=> groupCompare(a,b) || sortCompare(a,b,sort));
 
   groupCounts = new Map();
-  if(groupSelect.value){
-    filtered.forEach(r=>{ const k = groupKey(r); groupCounts.set(k, (groupCounts.get(k)||0) + 1); });
+  topGroupIds = [];
+  if(groupLevels.length){
+    filtered.forEach(r=>{
+      groupIdsFor(r).forEach((id, i)=>{
+        if(!groupCounts.has(id)){ groupCounts.set(id, 0); if(i === 0) topGroupIds.push(id); }
+        groupCounts.set(id, groupCounts.get(id) + 1);
+      });
+    });
   }
-  groupKeys = Array.from(groupCounts.keys());
-  groupIndex = new Map(groupKeys.map((k, i) => [k, i]));
-  if(collapsedMode !== groupSelect.value){   // switching Brand <-> End date starts fully expanded
+  const mode = groupLevels.join('>');
+  if(collapsedMode !== mode){   // changing the grouping starts fully expanded
     collapsedGroups = new Set();
-    collapsedMode = groupSelect.value;
+    collapsedMode = mode;
   }
 
   shown = 0;
@@ -966,26 +1017,26 @@ function applyFilters(){
 }
 
 function renderPage(reset, target = PAGE_SIZE){
-  if(reset){ grid.innerHTML = ''; lastGroupKey = null; }
+  if(reset){ grid.innerHTML = ''; lastGroupIds = []; }
   if(filtered.length === 0){
     grid.innerHTML = `<div class="empty-state"><span class="glyph">∅</span>No items match these filters.<br><button id="resetFromEmpty">Clear filters</button></div>`;
     document.getElementById('resetFromEmpty').onclick = clearFilters;
     loadMoreWrap.style.display = 'none';
   } else {
-    const grouped = !!groupSelect.value;
     let html = '';
     let visible = 0;
     while(shown < filtered.length && visible < target){
       const r = filtered[shown++];
-      let gi = null, hidden = false;
-      if(grouped){
-        const k = groupKey(r);
-        gi = groupIndex.get(k);
-        hidden = collapsedGroups.has(k);
-        if(k !== lastGroupKey){ lastGroupKey = k; html += groupHeaderHtml(k); }
-      }
-      if(!hidden) visible++;
-      html += cardHtml(r, hidden, gi);
+      let hidden = false;   // true once any enclosing group is collapsed
+      groupIdsFor(r).forEach((id, i)=>{
+        if(id !== lastGroupIds[i]){
+          lastGroupIds.length = i;
+          lastGroupIds[i] = id;
+          if(!hidden) html += groupHeaderHtml(groupLevels[i], i + 1, keyFor(groupLevels[i], r), id);
+        }
+        if(collapsedGroups.has(id)) hidden = true;
+      });
+      if(!hidden){ visible++; html += cardHtml(r); }
     }
     grid.insertAdjacentHTML('beforeend', html);
     loadMoreWrap.style.display = shown < filtered.length ? 'flex' : 'none';
@@ -1004,13 +1055,14 @@ function clearFilters(){
   dateToInput.value = '';
   updateDateBounds();
   groupSelect.value = '';
+  thenSelect.value = '';
   sortSelect.value = 'recent';
   applyFilters();
 }
 
 loadMoreBtn.addEventListener('click', ()=>renderPage(false));
 [searchInput].forEach(el=>el.addEventListener('input', applyFilters));
-[categoryFilter, brandFilter, typeFilter, offerFilter, groupSelect, sortSelect]
+[categoryFilter, brandFilter, typeFilter, offerFilter, groupSelect, thenSelect, sortSelect]
   .forEach(el=>el.addEventListener('change', applyFilters));
 // 'input' fires as soon as a typed date is complete; 'change' covers the picker
 [dateFromInput, dateToInput].forEach(el=>['input', 'change'].forEach(ev=>
