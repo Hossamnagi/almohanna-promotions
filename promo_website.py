@@ -402,6 +402,12 @@ select:focus{outline:none;border-color:var(--violet);}
   font-weight:600;
 }
 .clear-btn:hover{background:rgba(255,95,168,0.1);}
+.date-filter{
+  display:flex;align-items:center;gap:8px;
+  padding:3px;
+  border:1px dashed var(--border);
+  border-radius:var(--radius-m);
+}
 .date-field{
   display:flex;align-items:center;gap:6px;
   font-size:12px;
@@ -633,6 +639,7 @@ main{max-width:1320px;margin:0 auto;padding:26px 28px 60px;}
   main{padding:18px 16px 50px;}
   .filters-row{display:grid;grid-template-columns:1fr 1fr;}
   select{max-width:none;width:100%;min-width:0;}
+  .date-filter{grid-column:1/-1;display:grid;grid-template-columns:1fr 1fr 1fr;align-items:end;}
   .date-field{flex-direction:column;align-items:stretch;gap:3px;min-width:0;}
   .date-field input{width:100%;min-width:0;}
 }
@@ -671,8 +678,14 @@ TEMPLATE_BODY = """<header class="masthead">
       <select id="brandFilter"><option value="">All brands</option></select>
       <select id="typeFilter"><option value="">All promotion types</option></select>
       <select id="offerFilter"><option value="">All offers</option></select>
-      <label class="date-field">Starts from <input type="date" id="startFrom"></label>
-      <label class="date-field">Ends by <input type="date" id="endBy"></label>
+      <div class="date-filter">
+        <select id="dateField" aria-label="Date to filter on">
+          <option value="endDate">End date</option>
+          <option value="actDate">Activation date</option>
+        </select>
+        <label class="date-field">From <input type="date" id="dateFrom"></label>
+        <label class="date-field">To <input type="date" id="dateTo"></label>
+      </div>
       <select id="groupSelect">
         <option value="">Group: None</option>
         <option value="brand">Group: Brand</option>
@@ -726,8 +739,9 @@ const categoryFilter = document.getElementById('categoryFilter');
 const brandFilter = document.getElementById('brandFilter');
 const typeFilter = document.getElementById('typeFilter');
 const offerFilter = document.getElementById('offerFilter');
-const startFromInput = document.getElementById('startFrom');
-const endByInput = document.getElementById('endBy');
+const dateField = document.getElementById('dateField');
+const dateFromInput = document.getElementById('dateFrom');
+const dateToInput = document.getElementById('dateTo');
 const groupSelect = document.getElementById('groupSelect');
 const sortSelect = document.getElementById('sortSelect');
 const resultCount = document.getElementById('resultCount');
@@ -879,6 +893,11 @@ function toggleGroup(header){
   header.classList.toggle('collapsed', collapse);
   header.setAttribute('aria-expanded', String(!collapse));
   grid.querySelectorAll(`.card[data-gi="${gi}"]`).forEach(c => c.classList.toggle('group-hidden', collapse));
+  // collapsing hides cards, so pull in the next groups to keep a full page
+  if(collapse){
+    const visibleNow = grid.querySelectorAll('.card:not(.group-hidden)').length;
+    if(visibleNow < PAGE_SIZE) renderPage(false, PAGE_SIZE - visibleNow);
+  }
   updateToggleAllBtn();
 }
 
@@ -890,6 +909,17 @@ function toggleAllGroups(){
   updateToggleAllBtn();
 }
 
+// Calendars only offer dates that exist for the chosen field, and From / To
+// can't cross each other.
+function updateDateBounds(){
+  const vals = DATA.map(r=>r[dateField.value]).filter(Boolean).sort();
+  const lo = vals[0] || '', hi = vals[vals.length - 1] || '';
+  dateFromInput.min = lo;
+  dateFromInput.max = dateToInput.value || hi;
+  dateToInput.min = dateFromInput.value || lo;
+  dateToInput.max = hi;
+}
+
 function applyFilters(){
   const q = searchInput.value.trim().toLowerCase();
   const cat = categoryFilter.value;
@@ -898,16 +928,17 @@ function applyFilters(){
   const offer = offerFilter.value;
   // date inputs give 'YYYY-MM-DD', the same format as actDate/endDate,
   // so plain string comparison orders them correctly
-  const startFrom = startFromInput.value;
-  const endBy = endByInput.value;
+  const dField = dateField.value;
+  const dFrom = dateFromInput.value;
+  const dTo = dateToInput.value;
 
   filtered = DATA.filter(r=>{
     if(cat && r.subGroup !== cat) return false;
     if(brand && r.brand !== brand) return false;
     if(type && r.type !== type) return false;
     if(offer && r.offer !== offer) return false;
-    if(startFrom && (!r.actDate || r.actDate < startFrom)) return false;
-    if(endBy && (!r.endDate || r.endDate > endBy)) return false;
+    if(dFrom && (!r[dField] || r[dField] < dFrom)) return false;
+    if(dTo && (!r[dField] || r[dField] > dTo)) return false;
     if(q){
       const hay = (r.nameEn+' '+r.nameAr+' '+r.brand+' '+r.code+' '+r.barcode).toLowerCase();
       if(!hay.includes(q)) return false;
@@ -934,7 +965,7 @@ function applyFilters(){
   updateToggleAllBtn();
 }
 
-function renderPage(reset){
+function renderPage(reset, target = PAGE_SIZE){
   if(reset){ grid.innerHTML = ''; lastGroupKey = null; }
   if(filtered.length === 0){
     grid.innerHTML = `<div class="empty-state"><span class="glyph">∅</span>No items match these filters.<br><button id="resetFromEmpty">Clear filters</button></div>`;
@@ -944,7 +975,7 @@ function renderPage(reset){
     const grouped = !!groupSelect.value;
     let html = '';
     let visible = 0;
-    while(shown < filtered.length && visible < PAGE_SIZE){
+    while(shown < filtered.length && visible < target){
       const r = filtered[shown++];
       let gi = null, hidden = false;
       if(grouped){
@@ -968,8 +999,10 @@ function clearFilters(){
   brandFilter.value = '';
   typeFilter.value = '';
   offerFilter.value = '';
-  startFromInput.value = '';
-  endByInput.value = '';
+  dateField.value = 'endDate';
+  dateFromInput.value = '';
+  dateToInput.value = '';
+  updateDateBounds();
   groupSelect.value = '';
   sortSelect.value = 'recent';
   applyFilters();
@@ -977,8 +1010,12 @@ function clearFilters(){
 
 loadMoreBtn.addEventListener('click', ()=>renderPage(false));
 [searchInput].forEach(el=>el.addEventListener('input', applyFilters));
-[categoryFilter, brandFilter, typeFilter, offerFilter, startFromInput, endByInput, groupSelect, sortSelect]
+[categoryFilter, brandFilter, typeFilter, offerFilter, groupSelect, sortSelect]
   .forEach(el=>el.addEventListener('change', applyFilters));
+// 'input' fires as soon as a typed date is complete; 'change' covers the picker
+[dateFromInput, dateToInput].forEach(el=>['input', 'change'].forEach(ev=>
+  el.addEventListener(ev, ()=>{ updateDateBounds(); applyFilters(); })));
+dateField.addEventListener('change', ()=>{ updateDateBounds(); applyFilters(); });
 clearBtn.addEventListener('click', clearFilters);
 toggleAllBtn.addEventListener('click', toggleAllGroups);
 grid.addEventListener('click', e=>{
@@ -1003,14 +1040,7 @@ document.getElementById('brandCount').textContent = new Set(DATA.map(r=>r.brand)
 const actDates = DATA.map(r=>r.actDate).filter(Boolean).map(d=>new Date(d+'T00:00:00'));
 MAX_ACT_DATE = actDates.length ? new Date(Math.max(...actDates)) : null;
 
-// limit both calendars to the date range that actually exists in the data
-const allDates = DATA.flatMap(r=>[r.actDate, r.endDate]).filter(Boolean).sort();
-if(allDates.length){
-  [startFromInput, endByInput].forEach(el=>{
-    el.min = allDates[0];
-    el.max = allDates[allDates.length - 1];
-  });
-}
+updateDateBounds();
 
 applyFilters();
 
