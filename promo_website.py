@@ -1164,12 +1164,26 @@ async function nativeDetectorSupported(){
 
 function cameraErrorMessage(e){
   return (e && e.name === 'NotAllowedError')
-    ? 'Camera permission was denied.'
+    ? 'Camera permission is blocked. Tap the icon left of the address bar > Permissions > Camera > Allow, then try again.'
     : (e && e.message) ? e.message : 'Camera unavailable in this view.';
 }
 
+// Medicine packs carry GS1 codes (DataMatrix, GS1 QR, GS1-128 or a GS1 Digital
+// Link URL) that pack GTIN + expiry + batch + serial into one string - search
+// on the GTIN (AI 01) only. Leading zeros are dropped so a 14-digit GTIN also
+// matches an item stored with its 13-digit EAN (and vice versa).
+function scanToQuery(raw){
+  let s = String(raw || '').trim();
+  const link = s.match(/\\/01\\/(\\d{14})(?:[\\/?#]|$)/);
+  if(link) return link[1].replace(/^0+/, '');
+  s = s.replace(/^\\][A-Za-z]\\d/, '');          // symbology identifier, e.g. ]d2
+  const ai = s.match(/(?:^|\\x1d)\\(?01\\)?(\\d{14})/);
+  if(ai) return ai[1].replace(/^0+/, '');
+  return /^\\d+$/.test(s) ? s.replace(/^0+/, '') : s;
+}
+
 async function startNativeScanner(){
-  const wanted = ['ean_13','ean_8','upc_a','upc_e','code_128','code_39','itf','codabar','qr_code'];
+  const wanted = ['ean_13','ean_8','upc_a','upc_e','code_128','code_39','itf','codabar','qr_code','data_matrix'];
   let formats = wanted;
   try{
     const available = await BarcodeDetector.getSupportedFormats();
@@ -1202,7 +1216,7 @@ async function startNativeScanner(){
         const codes = await detector.detect(scanVideo);
         if(codes && codes.length){
           nativeLoopActive = false;
-          searchInput.value = codes[0].rawValue;
+          searchInput.value = scanToQuery(codes[0].rawValue);
           applyFilters();
           closeScanner();
           return;
@@ -1226,7 +1240,7 @@ async function startZXingScanner(){
     scanVideo,
     (result, err, controls) => {
       if(result){
-        searchInput.value = result.getText();
+        searchInput.value = scanToQuery(result.getText());
         applyFilters();
         closeScanner();
       }
